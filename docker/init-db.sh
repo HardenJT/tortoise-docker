@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MARKER_DIR="${INIT_MARKER_DIR:-/var/lib/turtle-init}"
+MARKER_FILE="${MARKER_DIR}/initialized"
+SQL_ROOT="${SQL_DIR:-/opt/turtle/sql}"
+
+DB_HOST="${DB_HOST:-db}"
+DB_PORT="${DB_PORT:-3306}"
+DB_ROOT_PASSWORD="${DB_ROOT_PASSWORD:-${MYSQL_ROOT_PASSWORD:-}}"
+DB_USER="${DB_USER:-mangos}"
+DB_PASSWORD="${DB_PASSWORD:-mangos}"
+DB_LOGIN="${DB_LOGIN:-tw_logon}"
+DB_WORLD="${DB_WORLD:-tw_world}"
+DB_CHAR="${DB_CHAR:-tw_char}"
+DB_LOGS="${DB_LOGS:-tw_logs}"
+
+REALM_NAME="${REALM_NAME:-TurtleWoW}"
+REALM_ADDRESS="${REALM_ADDRESS:-127.0.0.1}"
+WORLD_PORT="${WORLD_PORT:-8090}"
+REALM_ID="${REALM_ID:-1}"
+
+PLAYERBOTS_BUILT="${PLAYERBOTS_BUILT:-ON}"
+
+if [[ -z "${DB_ROOT_PASSWORD}" ]]; then
+  echo "DB_ROOT_PASSWORD (or MYSQL_ROOT_PASSWORD) is required." >&2
+  exit 1
+fi
+
+mysql_root() {
+  mysql -h"${DB_HOST}" -P"${DB_PORT}" -uroot -p"${DB_ROOT_PASSWORD}" --protocol=TCP "$@"
+}
+
+echo "Waiting for MariaDB at ${DB_HOST}:${DB_PORT}..."
+for i in $(seq 1 90); do
+  if mysql_root -e "SELECT 1" &>/dev/null; then
+    break
+  fi
+  if [[ "${i}" -eq 90 ]]; then
+    echo "MariaDB did not become ready in time." >&2
+    exit 1
+  fi
+  sleep 2
+done
+echo "MariaDB is ready."
+
+if [[ -f "${MARKER_FILE}" ]]; then
+  echo "Init marker found (${MARKER_FILE}); skipping database import."
+  exit 0
+fi
+
+if [[ ! -f "${SQL_ROOT}/create_databases.sql" ]]; then
+  echo "Missing ${SQL_ROOT}/create_databases.sql" >&2
+  exit 1
+fi
+
+echo "Creating databases and base schemas..."
+mysql_root < "${SQL_ROOT}/create_databases.sql"
+
+echo "Creating application user '${DB_USER}' and grants..."
+mysql_root <<SQL
+CREATE USER IF NOT EXISTS '${DB_USER}'@'%' IDENTIFIED BY '${DB_PASSWORD}';
+ALTER USER '${DB_USER}'@'%' IDENTIFIED BY '${DB_PASSWORD}';
+GRANT ALL PRIVILEGES ON \`${DB_LOGIN}\`.* TO '${DB_USER}'@'%';
+GRANT ALL PRIVILEGES ON \`${DB_WORLD}\`.* TO '${DB_USER}'@'%';
+GRANT ALL PRIVILEGES ON \`${DB_CHAR}\`.* TO '${DB_USER}'@'%';
+GRANT ALL PRIVILEGES ON \`${DB_LOGS}\`.* TO '${DB_USER}'@'%';
+FLUSH PRIVILEGES;
+SQL
+
+echo "Importing world content from sql/base (this can take several minutes)..."
+shopt -s nullglob
+base_files=("${SQL_ROOT}"/base/*.sql)
+if [[ "${#base_files[@]}" -eq 0 ]]; then
+  echo "No SQL files found under ${SQL_ROOT}/base" >&2
+  exit 1
+fi
+for f in "${base_files[@]}"; do
+  echo "  -> $(basename "${f}")"
+  mysql_root "${DB_WORLD}" < "${f}"
+done
+
+echo "Applying database_updates with --force (duplicate keys expected)..."
+update_files=("${SQL_ROOT}"/database_updates/*.sql)
+for f in "${update_files[@]}"; do
+  echo "  -> $(basename "${f}")"
+  mysql_root --force "${DB_WORLD}" < "${f}" || true
+done
+
+# AutoUpdater keys applied rows by file SHA1 (not by name). Hash 'manual'
+# never matches, so mangosd would retry every update and die on duplicates.
+echo "Recording migrations as applied (SHA1 hashes)..."
+mysql_root -e "DELETE FROM ${DB_WORLD}.migrations;"
+for f in "${update_files[@]}"; do
+  n="$(basename "${f}" .sql)"
+  h="$(sha1sum "${f}" | awk '{ print toupper($1) }')"
+  mysql_root -e "INSERT INTO ${DB_WORLD}.migrations (Name, Hash, AppliedAt) VALUES ('${n}','${h}',NOW());"
+done
+
+# Verify a known schema change from migrations landed.
+col_count="$(mysql_root -N -e "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='${DB_WORLD}' AND TABLE_NAME='spell_template' AND COLUMN_NAME='script_name';")"
+if [[ "${col_count}" != "1" ]]; then
+  echo "WARNING: spell_template.script_name not found after migrations (got count=${col_count})." >&2
+fi
+
+# Playerbot tables (only when this image was built with BUILD_PLAYERBOTS=ON)
+normalized="$(echo "${PLAYERBOTS_BUILT}" | tr '[:lower:]' '[:upper:]')"
+if [[ "${normalized}" == "ON" || "${normalized}" == "1" || "${normalized}" == "TRUE" ]]; then
+  PB_SQL="${SQL_ROOT}/playerbots"
+  if [[ -d "${PB_SQL}" ]]; then
+    echo "Importing playerbots world SQL..."
+    cat "${PB_SQL}"/world/*.sql "${PB_SQL}"/world/classic/*.sql | mysql_root "${DB_WORLD}"
+    echo "Importing playerbots characters SQL..."
+    cat "${PB_SQL}"/characters/*.sql | mysql_root "${DB_CHAR}"
+  else
+    echo "PLAYERBOTS_BUILT=${PLAYERBOTS_BUILT} but ${PB_SQL} is missing." >&2
+    exit 1
+  fi
+else
+  echo "Skipping playerbots SQL (PLAYERBOTS_BUILT=${PLAYERBOTS_BUILT})."
+fi
+
+echo "Inserting realmlist row..."
+mysql_root <<SQL
+DELETE FROM ${DB_LOGIN}.realmlist;
+INSERT INTO ${DB_LOGIN}.realmlist
+  (id, name, address, port, icon, realmflags, timezone, allowedSecurityLevel, realmbuilds)
+VALUES
+  (${REALM_ID}, '${REALM_NAME}', '${REALM_ADDRESS}', ${WORLD_PORT}, 0, 0, 1, 0, '7272');
+SQL
+
+mkdir -p "${MARKER_DIR}"
+date -u +"%Y-%m-%dT%H:%M:%SZ" > "${MARKER_FILE}"
+echo "Database init complete."
