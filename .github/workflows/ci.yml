@@ -2,11 +2,6 @@ name: CI
 
 on:
   pull_request:
-    paths:
-      - "Dockerfile"
-      - "docker/**"
-      - ".github/workflows/ci.yml"
-      - ".github/workflows/publish.yml"
 
 permissions:
   contents: read
