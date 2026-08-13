@@ -1,0 +1,64 @@
+name: Generate mmaps
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: map0
+            maps: "0"
+          - name: map1
+            maps: "1"
+          - name: rest
+            maps: "rest"
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download input data
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download mmaps-input-v1 -R ${{ github.repository }} -p mmaps-input.zip
+          unzip -q mmaps-input.zip
+          mkdir -p mmaps
+          ls maps | head -3
+
+      - name: Generate
+        run: |
+          IMG=ghcr.io/${{ github.repository }}:playerbots
+          docker pull -q "$IMG"
+          run_map() {
+            echo "=== MoveMapGen map $1 ==="
+            docker run --rm -v "$PWD:/data" -w /data --entrypoint /opt/turtle/bin/MoveMapGen "$IMG" "$1" --silent
+          }
+          if [ "${{ matrix.maps }}" = "rest" ]; then
+            for id in $(ls maps | cut -c1-3 | sort -u); do
+              case "$id" in 000|001) continue;; esac
+              run_map $((10#$id))
+            done
+          else
+            run_map ${{ matrix.maps }}
+          fi
+          echo "tiles generated: $(ls mmaps | wc -l)"
+
+      - name: Upload mmaps
+        uses: actions/upload-artifact@v4
+        with:
+          name: mmaps-${{ matrix.name }}
+          path: mmaps/
+          retention-days: 3
