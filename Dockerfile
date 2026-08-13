@@ -15,6 +15,8 @@ ARG SOURCE_REPO=https://github.com/Shyalya/tortoise-wow.git
 ARG SOURCE_REF=playerbots-integration-gh
 ARG CMAKE_BUILD_TYPE=Release
 ARG CMAKE_INSTALL_PREFIX=/opt/turtle
+# Capped: -j$(nproc) on a 28-core host OOMs the 16GB WSL2 VM and crashes dockerd
+ARG BUILD_JOBS=8
 
 ENV DEBIAN_FRONTEND=noninteractive \
     TZ=UTC
@@ -45,7 +47,7 @@ RUN cmake -B build \
         -DBUILD_PLAYERBOTS="${BUILD_PLAYERBOTS}" \
         -DUSE_EXTRACTORS="${USE_EXTRACTORS}" \
         -DALLOW_TURTLE_ADDONS=ON \
-    && cmake --build build -j"$(nproc)" \
+    && cmake --build build -j"${BUILD_JOBS}" \
     && cmake --install build
 
 # Keep SQL needed for first-time DB init + AutoUpdate path.
